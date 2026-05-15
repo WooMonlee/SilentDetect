@@ -2,14 +2,9 @@ namespace SilentParamQuery
 {
     partial class MainForm
     {
-        private System.ComponentModel.IContainer components = null;
-
+        // 修复：移除无用components字段(始终为null，冗余代码)
         protected override void Dispose(bool disposing)
         {
-            if (disposing && (components != null))
-            {
-                components.Dispose();
-            }
             base.Dispose(disposing);
         }
 

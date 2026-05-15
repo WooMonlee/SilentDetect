@@ -43,21 +43,6 @@ inline int Utf8ToWide(const char* utf8, wchar_t* wide, int wideLen) {
 }
 
 // ============================================================
-// Case-insensitive strstr
-// ============================================================
-
-inline const char* stristr(const char* haystack, const char* needle) {
-    if (!haystack || !needle || !*needle) return nullptr;
-    size_t nlen = strlen(needle);
-    for (const char* p = haystack; *p; ++p) {
-        if (tolower((unsigned char)*p) == tolower((unsigned char)*needle) &&
-            _strnicmp(p, needle, nlen) == 0)
-            return p;
-    }
-    return nullptr;
-}
-
-// ============================================================
 // #1 NSIS
 // ============================================================
 

@@ -12,6 +12,7 @@
 #include <vector>
 #include <cstdio>
 #include <thread>
+#include <future>  // 修复：用于后台线程安全等待
 #include "resource.h"
 #include "database.h"
 #include "scanner.h"
@@ -33,12 +34,15 @@
 
 static HINSTANCE g_hInst;
 static HWND g_hWnd;
-static std::wstring g_toolsPath; // Path to Tools directory (may be temp)
+static bool g_toolsExtractedToTemp = false; // 修复：替代main.cpp中重复的g_toolsPath，标记是否解压到临时目录
+static std::future<void> g_extractFuture; // 修复：后台解压线程future，用于安全等待
 
 // ============================================================
 // Debug log to file
 // ============================================================
 
+// 日志开关：定义DEBUG_LOG宏时输出debug_log.txt，否则日志函数为空操作
+#ifdef DEBUG_LOG
 static std::wstring g_logPath;
 
 static void InitLog() {
@@ -50,7 +54,6 @@ static void InitLog() {
         exeDir = exeDir.substr(0, lastSlash);
     g_logPath = exeDir + L"\\debug_log.txt";
 
-    // Clear log file
     FILE* f = _wfopen(g_logPath.c_str(), L"w");
     if (f) {
         fprintf(f, "=== Debug Log ===\n");
@@ -61,7 +64,6 @@ static void InitLog() {
 static void Log(const char* fmt, ...) {
     FILE* f = _wfopen(g_logPath.c_str(), L"a");
     if (!f) return;
-
     va_list args;
     va_start(args, fmt);
     vfprintf(f, fmt, args);
@@ -73,7 +75,6 @@ static void Log(const char* fmt, ...) {
 static void LogW(const wchar_t* fmt, ...) {
     FILE* f = _wfopen(g_logPath.c_str(), L"a");
     if (!f) return;
-
     va_list args;
     va_start(args, fmt);
     vfwprintf(f, fmt, args);
@@ -81,6 +82,11 @@ static void LogW(const wchar_t* fmt, ...) {
     fwprintf(f, L"\n");
     fclose(f);
 }
+#else
+static inline void InitLog() {}
+static inline void Log(const char*, ...) {}
+static inline void LogW(const wchar_t*, ...) {}
+#endif
 
 // ============================================================
 // Extract embedded Tools.zip to temp directory
@@ -116,7 +122,8 @@ static bool ExtractToolsZip() {
     // Check if already extracted (by checking for diec.exe)
     std::wstring diecCheck = toolsDir + L"\\Tools\\diec.exe";
     if (GetFileAttributesW(diecCheck.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        g_toolsPath = toolsDir + L"\\Tools";
+        SetToolsPath(toolsDir + L"\\Tools"); // 修复：直接同步到scanner.cpp，消除main.cpp重复g_toolsPath
+        g_toolsExtractedToTemp = true;
         Log("Already extracted, found diec.exe");
         return true;
     }
@@ -137,8 +144,17 @@ static bool ExtractToolsZip() {
     bool extracted = false;
 
     // Use PowerShell to extract
+    // 修复：PowerShell命令注入 — 转义路径中的单引号（PowerShell中用 '' 表示一个字面单引号）
+    std::wstring escapedZip = zipPath, escapedDir = extractDir;
+    for (std::wstring* s : {&escapedZip, &escapedDir}) {
+        size_t p = 0;
+        while ((p = s->find(L'\'', p)) != std::wstring::npos) {
+            s->insert(p, L"'");
+            p += 2;
+        }
+    }
     std::wstring cmd = L"powershell -NoProfile -Command \"Expand-Archive -Path '"
-        + zipPath + L"' -DestinationPath '" + extractDir + L"' -Force\"";
+        + escapedZip + L"' -DestinationPath '" + escapedDir + L"' -Force\"";
     LogW(L"Running command: %s", cmd.c_str());
 
     STARTUPINFOW si = {sizeof(si)};
@@ -174,9 +190,10 @@ static bool ExtractToolsZip() {
         (attr != INVALID_FILE_ATTRIBUTES) ? "YES" : "NO");
 
     if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        g_toolsPath = toolsPath;
+        SetToolsPath(toolsPath); // 修复：同步到scanner.cpp
+        g_toolsExtractedToTemp = true;
         DeleteFileW(zipPath.c_str());
-        LogW(L"Tools found at: %s", g_toolsPath.c_str());
+        LogW(L"Tools found at: %s", toolsPath.c_str());
         return true;
     }
 
@@ -184,7 +201,8 @@ static bool ExtractToolsZip() {
     toolsPath = extractDir;
     attr = GetFileAttributesW((toolsPath + L"\\diec.exe").c_str());
     if (attr != INVALID_FILE_ATTRIBUTES) {
-        g_toolsPath = toolsPath;
+        SetToolsPath(toolsPath); // 修复：同步到scanner.cpp
+        g_toolsExtractedToTemp = true;
         DeleteFileW(zipPath.c_str());
         return true;
     }
@@ -208,7 +226,7 @@ static bool FindToolsInExeDir() {
         std::wstring diecPath = toolsPath + L"\\diec.exe";
         attr = GetFileAttributesW(diecPath.c_str());
         if (attr != INVALID_FILE_ATTRIBUTES) {
-            g_toolsPath = toolsPath;
+            SetToolsPath(toolsPath); // 修复：同步到scanner.cpp
             return true;
         }
     }
@@ -234,6 +252,69 @@ static ScanResult g_currentResult;
 static bool g_hasResult = false;
 
 // ============================================================
+// Command-line argument parsing
+// ============================================================
+
+struct CliArgs {
+    std::wstring outFile;       // /out:file or -out:file
+    bool runExes = false;       // /run or -run
+    bool runAll = false;        // /all or -all
+    bool copyCmd = false;       // /copy or -copy
+    std::wstring inputFile;     // file to scan (no prefix)
+};
+
+static CliArgs ParseCommandLine(LPWSTR lpCmdLine) {
+    CliArgs args;
+    std::wstring cmdLine(lpCmdLine);
+
+    size_t i = 0;
+    while (i < cmdLine.size()) {
+        while (i < cmdLine.size() && cmdLine[i] == L' ') i++;
+        if (i >= cmdLine.size()) break;
+
+        std::wstring token;
+        if (cmdLine[i] == L'"') {
+            i++;
+            while (i < cmdLine.size() && cmdLine[i] != L'"') {
+                token += cmdLine[i];
+                i++;
+            }
+            if (i < cmdLine.size()) i++;
+        } else {
+            while (i < cmdLine.size() && cmdLine[i] != L' ') {
+                token += cmdLine[i];
+                i++;
+            }
+        }
+
+        if (token.empty()) continue;
+
+        if (token[0] == L'-' || token[0] == L'/') {
+            std::wstring sw = token.substr(1);
+            for (auto& c : sw) {
+                if (c == L'\xFF1A') c = L':'; // fullwidth colon → ASCII
+            }
+
+            if (sw.find(L"out:") == 0) {
+                args.outFile = sw.substr(4); // after "out:"
+                if (args.outFile.size() >= 2 && args.outFile.front() == L'"' && args.outFile.back() == L'"')
+                    args.outFile = args.outFile.substr(1, args.outFile.size() - 2);
+            }
+            else if (sw == L"run")  args.runExes = true;
+            else if (sw == L"all")  args.runAll = true;
+            else if (sw == L"copy") args.copyCmd = true;
+        } else {
+            args.inputFile = token;
+        }
+    }
+
+    return args;
+}
+
+// Headless mode: scan file and write results to output file
+// (defined after AToW helper below)
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -248,6 +329,69 @@ static std::wstring AToW(const char* s) {
 
 static std::wstring AToW(const std::string& s) {
     return AToW(s.c_str());
+}
+
+// Headless mode: scan file and write results to output file
+static int HeadlessScan(const std::wstring& inputFile, const std::wstring& outFile) {
+    if (!FindToolsInExeDir()) {
+        if (!ExtractToolsZip()) {
+            // 修复：MinGW不支持_wfopen的ccs=UTF-8扩展，改用二进制写+BOM
+            FILE* f = _wfopen(outFile.c_str(), L"wb");
+            if (f) {
+                unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+                fwrite(bom, 1, 3, f);
+                fwrite("\xE9\x94\x99\xE8\xAF\xAF: \xE5\xB7\xA5\xE5\x85\xB7\xE7\xBB\x84\xE4\xBB\xB6\xE8\xA7\xA3\xE5\x8E\x8B\xE5\xA4\xB1\xE8\xB4\xA5\n", 1, 30, f);
+                fclose(f);
+            }
+            return 1;
+        }
+    }
+    // FindToolsInExeDir / ExtractToolsZip already call SetToolsPath internally
+
+    DetectorEngine engine;
+    ScanResult result = engine.Scan(inputFile);
+
+    // Build output as UTF-8 string (avoid fwprintf + ccs=UTF-8 which is unsupported in MinGW)
+    std::string out;
+    out.reserve(4096);
+
+    auto WToU8 = [](const std::wstring& ws) -> std::string {
+        if (ws.empty()) return "";
+        int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 0) return "";
+        std::string s(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &s[0], len, nullptr, nullptr);
+        return s;
+    };
+
+    out += "=== \xE5\xA4\xA7\xE5\x86\x85\xE9\x9D\x99\xE6\x8E\xA2 \xE6\x89\xAB\xE6\x8F\x8F\xE7\xBB\x93\xE6\x9E\x9C ===\r\n\r\n";
+    out += "\xE6\x96\x87\xE4\xBB\xB6: " + WToU8(inputFile) + "\r\n";
+
+    if (result.success) {
+        out += "\xE5\xAE\x89\xE8\xA3\x85\xE5\x99\xA8\xE7\xB1\xBB\xE5\x9E\x8B: " + result.installerFullName + " (" + result.installerType + ")\r\n";
+        out += "\xE7\x89\x88\xE6\x9C\xAC: --\r\n";
+        out += "\xE6\xA3\x80\xE6\xB5\x8B\xE6\x96\xB9\xE5\xBC\x8F: " + result.detectedBy + "\r\n";
+        out += "\xE7\xBD\xAE\xE4\xBF\xA1\xE5\xBA\xA6: " + WToU8(result.GetConfidenceStars()) + "\r\n";
+        out += "\xE9\x9D\x99\xE9\xBB\x98\xE5\x91\xBD\xE4\xBB\xA4: " + result.silentCommand + "\r\n\r\n";
+        out += "\xE9\x9D\x99\xE9\xBB\x98\xE5\xAE\x89\xE8\xA3\x85\xE5\x8F\x82\xE6\x95\xB0:\r\n";
+        for (const auto* p : result.params) {
+            if (!p) continue;
+            out += p->primary ? "  >> " : "    ";
+            out += std::string(p->sw) + " - " + std::string(p->desc) + "\r\n";
+        }
+    } else {
+        out += "\xE8\xAF\x86\xE5\x88\xAB\xE7\xBB\x93\xE6\x9E\x9C: \xE6\x9C\xAA\xE8\xAF\x86\xE5\x88\xAB\r\n";
+        out += "\xE6\xA3\x80\xE6\xB5\x8B\xE6\x96\xB9\xE5\xBC\x8F: " + result.detectedBy + "\r\n";
+        out += "\xE9\x94\x99\xE8\xAF\xAF\xE4\xBF\xA1\xE6\x81\xAF: " + result.errorMessage + "\r\n";
+    }
+
+    FILE* f = _wfopen(outFile.c_str(), L"wb");
+    if (!f) return 1;
+    unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    fwrite(bom, 1, 3, f);
+    fwrite(out.c_str(), 1, out.size(), f);
+    fclose(f);
+    return 0;
 }
 
 static bool IsValidFile(const std::wstring& path) {
@@ -311,10 +455,11 @@ static void LayoutControls(HWND hWnd) {
     MoveWindow(g_hLblType, col1x, y + 25, 170, 20, TRUE);
     MoveWindow(g_hLblConfCap, col2x, y + 25, 60, 20, TRUE);
     MoveWindow(g_hLblConf, col2x + 60, y + 25, 120, 25, TRUE);
+    int infoWidth = grpW - 2*innerPad - 85 - 10; // 修复：拓宽版本/检测方式标签显示DIE长文本
     MoveWindow(g_hLblVerCap, pad + innerPad, y + 50, 80, 20, TRUE);
-    MoveWindow(g_hLblVer, col1x, y + 50, 120, 20, TRUE);
+    MoveWindow(g_hLblVer, col1x, y + 50, infoWidth, 20, TRUE);
     MoveWindow(g_hLblDetCap, pad + innerPad, y + 73, 80, 20, TRUE);
-    MoveWindow(g_hLblDet, col1x, y + 73, 120, 20, TRUE);
+    MoveWindow(g_hLblDet, col1x, y + 73, infoWidth, 20, TRUE);
     y += 106;
 
     int paramsH = H - y - 216;
@@ -412,20 +557,33 @@ static void ScanFile(const std::wstring& filePath) {
         SetWindowTextW(g_hLblDrop, g_currentResult.fileName.c_str());
         SetStatus((L"扫描完成 - " + AToW(g_currentResult.installerFullName)).c_str());
     } else {
-        SetWindowTextW(g_hLblType, L"未识别");
-        InvalidateRect(g_hLblType, NULL, TRUE);
-        SetWindowTextW(g_hLblVer, L"--");
-        InvalidateRect(g_hLblVer, NULL, TRUE);
-        SetWindowTextW(g_hLblDet, AToW(g_currentResult.detectedBy).c_str());
-        InvalidateRect(g_hLblDet, NULL, TRUE);
-        SetWindowTextW(g_hLblConf, L"--");
-        InvalidateRect(g_hLblConf, NULL, TRUE);
+        // 修复：DIE检测到非安装器时，在"安装器"/"版本"行显示实际检测信息
+        if (!g_currentResult.dieDetection.empty()) {
+            SetWindowTextW(g_hLblType, L"非安装器程序"); // 非安装器程序
+            InvalidateRect(g_hLblType, NULL, TRUE);
+            std::wstring dieInfo = AToW(g_currentResult.dieDetection);
+            SetWindowTextW(g_hLblVer, dieInfo.c_str());
+            InvalidateRect(g_hLblVer, NULL, TRUE);
+            SetWindowTextW(g_hLblDet, AToW(g_currentResult.detectedBy).c_str());
+            InvalidateRect(g_hLblDet, NULL, TRUE);
+            SetWindowTextW(g_hLblConf, L"--");
+            InvalidateRect(g_hLblConf, NULL, TRUE);
+        } else {
+            SetWindowTextW(g_hLblType, L"未识别"); // 未识别
+            InvalidateRect(g_hLblType, NULL, TRUE);
+            SetWindowTextW(g_hLblVer, L"--");
+            InvalidateRect(g_hLblVer, NULL, TRUE);
+            SetWindowTextW(g_hLblDet, AToW(g_currentResult.detectedBy).c_str());
+            InvalidateRect(g_hLblDet, NULL, TRUE);
+            SetWindowTextW(g_hLblConf, L"--");
+            InvalidateRect(g_hLblConf, NULL, TRUE);
+        }
         SetWindowTextW(g_hTxtCmd, L"");
         InvalidateRect(g_hTxtCmd, NULL, TRUE);
         ListView_DeleteAllItems(g_hLstParams);
         EnableWindow(g_hBtnGenBat, FALSE);
         SetWindowTextW(g_hLblDrop, g_currentResult.fileName.c_str());
-        SetStatus((L"扫描失败 - " + AToW(g_currentResult.errorMessage)).c_str());
+        SetStatus((L"扫描失败 - " + AToW(g_currentResult.errorMessage)).c_str()); // 扫描失败
     }
 }
 
@@ -712,25 +870,22 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         DeleteObject(g_hBrushDrop);
         if (g_hIcon) DestroyIcon(g_hIcon);
 
-        // Cleanup temp Tools directory
-        if (!g_toolsPath.empty()) {
+        // 修复：等待后台解压线程完成再清理资源，避免竞态条件
+        if (g_extractFuture.valid()) {
+            g_extractFuture.wait_for(std::chrono::seconds(10));
+        }
+
+        // Cleanup temp Tools directory (only if we extracted to temp)
+        if (g_toolsExtractedToTemp) {
             wchar_t tempDir[MAX_PATH] = {};
             GetTempPathW(MAX_PATH, tempDir);
             std::wstring toolsDir = std::wstring(tempDir) + L"SilentParamQuery_Tools";
-            // Delete recursively
-            std::wstring cmd = L"cmd /c rmdir /s /q \"" + toolsDir + L"\"";
-            STARTUPINFOW si = {sizeof(si)};
-            si.dwFlags = STARTF_USESHOWWINDOW;
-            si.wShowWindow = SW_HIDE;
-            PROCESS_INFORMATION pi = {};
-            std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
-            cmdBuf.push_back(0);
-            if (CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE,
-                CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-                WaitForSingleObject(pi.hProcess, 5000);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
+            toolsDir.push_back(L'\0'); // SHFileOperation要求双null结尾
+            SHFILEOPSTRUCTW fop = {};
+            fop.wFunc = FO_DELETE;
+            fop.pFrom = toolsDir.c_str();
+            fop.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+            SHFileOperationW(&fop);
         }
 
         CoUninitialize();
@@ -746,6 +901,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) {
     g_hInst = hInstance;
+
+    // Parse command line early (before window creation for headless mode)
+    CliArgs cli = ParseCommandLine(lpCmdLine);
 
     // Initialize COM for Shell operations
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -767,7 +925,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
     std::wstring iconPath = exeDir + L"\\app.ico";
     g_hIcon = (HICON)LoadImageW(nullptr, iconPath.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
 
-    // Create window FIRST (show UI immediately)
+    // Headless mode: /out:filename or -out:filename
+    // Handle BEFORE creating any window — scan file, write results, exit
+    if (!cli.outFile.empty()) {
+        if (cli.inputFile.empty()) {
+            MessageBoxW(nullptr,
+                L"使用 /out:filename 时必须指定要扫描的文件。\n\n示例:\n  SilentParamQuery.exe /out:result.txt setup.exe",
+                L"参数错误", MB_OK | MB_ICONERROR);
+            CoUninitialize();
+            return 1;
+        }
+        // Sync extract Tools
+        if (!FindToolsInExeDir()) {
+            ExtractToolsZip();
+        }
+        // SetToolsPath already called inside FindToolsInExeDir/ExtractToolsZip
+        int result = HeadlessScan(cli.inputFile, cli.outFile);
+        CoUninitialize();
+        return result;
+    }
+
+    // Create window
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -779,8 +957,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
     if (g_hIcon) wc.hIcon = g_hIcon;
     RegisterClassExW(&wc);
 
-    // Title: 大内静探 v1.3
-    std::wstring title = L"\x5927\x5185\x9759\x63A2 v1.3";
+    std::wstring title = L"\x5927\x5185\x9759\x63A2 v1.3.2"; // 大内静探 v1.3.2
 
     g_hWnd = CreateWindowExW(
         WS_EX_ACCEPTFILES,
@@ -791,7 +968,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
 
     if (!g_hWnd) return 1;
 
-    // Show window immediately
     ShowWindow(g_hWnd, nCmdShow);
     UpdateWindow(g_hWnd);
 
@@ -801,30 +977,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
     Log("FindToolsInExeDir: %s", foundTools ? "FOUND" : "NOT FOUND");
 
     if (!foundTools) {
-        // Extract in background thread
         Log("Starting background extraction...");
-        SetStatus(L"\x6B63\x5728\x89E3\x538B\x5DE5\x5177\x7EC4\x4EF6..."); // 正在解压工具组件...
+        SetStatus(L"\x6B63\x5728\x89E3\x538B\x5DE5\x5177\x7EC4\x4EF6...");
 
-        std::thread([]() {
+        g_extractFuture = std::async(std::launch::async, []() {
             bool extractOk = ExtractToolsZip();
             Log("ExtractToolsZip: %s", extractOk ? "OK" : "FAILED");
-
-            if (!g_toolsPath.empty()) {
-                SetToolsPath(g_toolsPath);
-                Log("SetToolsPath called");
-            }
-
-            // Update DIE status on main thread
+            // SetToolsPath + g_toolsExtractedToTemp already set inside ExtractToolsZip
             PostMessage(g_hWnd, WM_USER + 1, 0, 0);
-        }).detach();
+        });
     } else {
-        // Tools already found, set path and update status
-        if (!g_toolsPath.empty()) {
-            SetToolsPath(g_toolsPath);
-            Log("SetToolsPath called");
-        }
+        // SetToolsPath already called inside FindToolsInExeDir
 
-        // Update DIE status
         DieScanner die;
         std::wstring countStr;
         if (die.IsAvailable()) {
@@ -840,14 +1004,34 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
         SendMessage(g_hWnd, WM_SETICON, ICON_SMALL, (LPARAM)g_hIcon);
     }
 
-    // If a file was passed via command line (drag onto exe), scan it
-    std::wstring cmdFile = lpCmdLine;
-    if (!cmdFile.empty()) {
-        // Remove surrounding quotes if present
-        if (cmdFile.size() >= 2 && cmdFile.front() == L'"' && cmdFile.back() == L'"')
-            cmdFile = cmdFile.substr(1, cmdFile.size() - 2);
-        if (GetFileAttributesW(cmdFile.c_str()) != INVALID_FILE_ATTRIBUTES)
-            ScanFile(cmdFile);
+    // GUI mode CLI actions: file scan + /copy
+    if (!cli.inputFile.empty() && GetFileAttributesW(cli.inputFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        ScanFile(cli.inputFile);
+
+        if (cli.copyCmd && g_hasResult && !g_currentResult.silentCommand.empty()) {
+            std::wstring cmd = AToW(g_currentResult.silentCommand);
+            if (OpenClipboard(g_hWnd)) {
+                EmptyClipboard();
+                size_t size = (cmd.size() + 1) * sizeof(wchar_t);
+                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+                if (hMem) {
+                    wchar_t* p = (wchar_t*)GlobalLock(hMem);
+                    memcpy(p, cmd.c_str(), size);
+                    GlobalUnlock(hMem);
+                    SetClipboardData(CF_UNICODETEXT, hMem);
+                }
+                CloseClipboard();
+            }
+        }
+    }
+
+    // /run or /all: trigger batch execution
+    if (cli.runExes && !cli.runAll) {
+        std::wstring dir = BR_GetExeDirectory();
+        BR_RunAll(g_hWnd, dir, RunFileType::ExeOnly);
+    } else if (cli.runAll) {
+        std::wstring dir = BR_GetExeDirectory();
+        BR_RunAll(g_hWnd, dir, RunFileType::AllRunnable);
     }
 
     MSG msg;

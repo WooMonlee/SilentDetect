@@ -20,6 +20,7 @@ struct ScanResult {
     double confidence;
     bool success;
     std::string errorMessage;
+    std::string dieDetection; // 修复：DIE检测到的非安装器信息（如".NET Framework"等）
 
     std::vector<const SilentParam*> params;
 

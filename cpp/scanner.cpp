@@ -97,10 +97,10 @@ static bool memistr_word(const BYTE* haystack, size_t hayLen, const char* needle
 std::vector<BYTE> PeScanner::ReadFileData(const std::wstring& filePath) {
     FILE* f = _wfopen(filePath.c_str(), L"rb");
     if (!f) return {};
-    fseek(f, 0, SEEK_END);
-    long fileSize = ftell(f);
+    _fseeki64(f, 0, SEEK_END);
+    __int64 fileSize = _ftelli64(f); // 修复：ftell对大文件(>2GB)溢出，改用_ftelli64
     if (fileSize <= 0) { fclose(f); return {}; }
-    size_t readSize = (size_t)std::min((long)MAX_SCAN_SIZE, fileSize);
+    size_t readSize = (size_t)std::min((__int64)MAX_SCAN_SIZE, fileSize);
     fseek(f, 0, SEEK_SET);
     std::vector<BYTE> data(readSize);
     size_t bytesRead = fread(data.data(), 1, readSize, f);
@@ -230,7 +230,8 @@ const InstallerInfo* PeScanner::ScanSections(const std::vector<BYTE>& data) {
     // Safe read of PE offset
     DWORD peOffset = 0;
     memcpy(&peOffset, &data[0x3C], 4);
-    if (peOffset + 24 > data.size()) return nullptr;
+    // 修复：peOffset负数/超大值校验 — 恶意PE构造导致越界
+    if (peOffset > (DWORD)(data.size() - 24)) return nullptr;
     if (data[peOffset] != 0x50 || data[peOffset+1] != 0x45) return nullptr; // "PE"
 
     WORD numSections = 0;
@@ -492,7 +493,14 @@ ScanResult DieScanner::Scan(const std::wstring& filePath) {
     }
 
     // Build command line
-    std::wstring cmd = L"\"" + m_diePath + L"\" --json \"" + filePath + L"\"";
+    // 修复：命令注入 — 转义文件路径中的双引号
+    std::wstring safePath = filePath;
+    size_t qPos = 0;
+    while ((qPos = safePath.find(L'"', qPos)) != std::wstring::npos) {
+        safePath.insert(qPos, L"\\");
+        qPos += 2;
+    }
+    std::wstring cmd = L"\"" + m_diePath + L"\" --json \"" + safePath + L"\"";
 
     // Create pipes for stdout
     HANDLE hRead, hWrite;
@@ -533,7 +541,15 @@ ScanResult DieScanner::Scan(const std::wstring& filePath) {
     CloseHandle(hRead);
 
     // Wait for process with timeout
-    WaitForSingleObject(pi.hProcess, 15000);
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, 15000);
+    // 修复：超时未退出 — 强制终止进程
+    if (waitResult == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        result.errorMessage = "DIE \xe6\x89\xab\xe6\x8f\x8f\xe8\xb6\x85\xe6\x97\xb6 (15\xe7\xa7\x92)\xef\xbc\x8c\xe5\xb7\xb2\xe7\xbb\x88\xe6\xad\xa2"; // DIE扫描超时(15秒)已终止
+        return result;
+    }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
@@ -543,16 +559,17 @@ ScanResult DieScanner::Scan(const std::wstring& filePath) {
     }
 
     // Parse JSON output - look for "Installer" type in detects
+    // 修复：MSIXBundle/MSIX 排在 MSI 前面，避免 sub-string 误匹配
     static const char* installerTypes[] = {
-        "NSIS", "Inno Setup", "InstallShield", "MSI", "WiX",
+        "NSIS", "Inno Setup", "InstallShield",
         "Advanced Installer", "Setup Factory", "Smart Install Maker",
         "Ghost Installer", "CreateInstall", "Actual Installer",
         "SetupBuilder", "InstallAware", "Wise",
         "RAR", "7-Zip", "7z SFX", "Clickteam",
         "Paquet Builder", "AutoPlay",
         "IExpress", "WExtract", "Squirrel", "BitRock",
-        "InstallScript", "WinZip", "WiX MSI",
-        "APPX", "MSIX", "MSIXBundle"
+        "InstallScript", "WinZip",
+        "APPX", "MSIXBundle", "MSIX", "WiX MSI", "WiX", "MSI"
     };
 
     // Find "detects" array
@@ -576,14 +593,15 @@ ScanResult DieScanner::Scan(const std::wstring& filePath) {
 
     if (detectedType.empty()) {
         // Also try matching from database string signatures
+        // 修复：预构建小写输出一次，避免每轮重复tolower整个字符串
+        std::string lowerOutput = output;
+        for (auto& c : lowerOutput) c = tolower((unsigned char)c);
         for (int i = 0; i < g_dbCount; i++) {
             const InstallerInfo& info = g_database[i];
             for (int j = 0; j < info.strSigCount; j++) {
                 if (info.strSigs[j]) {
                     // Case-insensitive search in JSON output
-                    std::string lowerOutput = output;
                     std::string lowerSig = info.strSigs[j];
-                    for (auto& c : lowerOutput) c = tolower((unsigned char)c);
                     for (auto& c : lowerSig) c = tolower((unsigned char)c);
                     if (lowerOutput.find(lowerSig) != std::string::npos) {
                         detectedType = info.strSigs[j];
@@ -596,7 +614,27 @@ ScanResult DieScanner::Scan(const std::wstring& filePath) {
     }
 
     if (detectedType.empty()) {
-        result.errorMessage = "DIE \xe6\x9c\xaa\xe8\x83\xbd\xe8\xaf\x86\xe5\x88\xab\xe5\xae\x89\xe8\xa3\x85\xe5\x99\xa8\xe7\xb1\xbb\xe5\x9e\x8b"; // DIE 未能识别安装器类型
+        // 修复：提取DIE实际检测结果告知用户文件是什么（即使非安装器）
+        std::string dieInfo;
+        size_t pos = 0;
+        while ((pos = output.find("\"string\"", pos)) != std::string::npos) {
+            pos += 8;
+            while (pos < output.size() && (output[pos] == ' ' || output[pos] == ':')) pos++;
+            if (pos < output.size() && output[pos] == '"') {
+                pos++;
+                size_t end = output.find('"', pos);
+                if (end != std::string::npos) {
+                    if (!dieInfo.empty()) dieInfo += "; ";
+                    dieInfo += output.substr(pos, end - pos);
+                    pos = end + 1;
+                }
+            }
+        }
+        if (!dieInfo.empty()) {
+            result.dieDetection = dieInfo; // 修复：传递DIE检测详情到UI层
+            result.errorMessage = "\xE9\x9D\x9E\xE5\xAE\x89\xE8\xA3\x85\xE5\x99\xA8\xE7\xA8\x8B\xE5\xBA\x8F (" + dieInfo + ")";
+        } else
+            result.errorMessage = "DIE \xE6\x9C\xAA\xE8\x83\xBD\xE8\xAF\x86\xE5\x88\xAB\xE5\xAE\x89\xE8\xA3\x85\xE5\x99\xA8\xE7\xB1\xBB\xE5\x9E\x8B";
         return result;
     }
 

@@ -50,10 +50,13 @@ namespace SilentParamQuery.Core
 
             try
             {
+                // 修复：命令注入 — 转义文件路径中的特殊字符（双引号 → \"  反斜杠 → \\）
+                string safePath = filePath.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
                 var psi = new ProcessStartInfo
                 {
                     FileName = _diePath,
-                    Arguments = $"--json \"{filePath}\"",
+                    Arguments = $"--json \"{safePath}\"",
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -61,11 +64,26 @@ namespace SilentParamQuery.Core
                     StandardOutputEncoding = Encoding.UTF8
                 };
 
+                string errorBuffer = ""; // 修复：收集 stderr 异步输出
+
                 using (var proc = Process.Start(psi))
                 {
+                    // 修复：死锁 - 使用异步读取 stderr 避免缓冲区满死锁
+                    proc.ErrorDataReceived += (s, e) => { if (e.Data != null) errorBuffer += e.Data + "\n"; };
+                    proc.BeginErrorReadLine();
                     string output = proc.StandardOutput.ReadToEnd();
-                    string error = proc.StandardError.ReadToEnd();
                     proc.WaitForExit(15000);
+
+                    // 修复：超时未退出 — 强制杀进程
+                    if (!proc.HasExited)
+                    {
+                        proc.Kill();
+                        proc.WaitForExit(3000);
+                        result.ErrorMessage = "DIE 扫描超时 (15秒)，已终止进程";
+                        return result;
+                    }
+
+                    string error = errorBuffer.Trim();
 
                     if (proc.ExitCode != 0 && string.IsNullOrEmpty(output))
                     {
@@ -105,15 +123,16 @@ namespace SilentParamQuery.Core
                 {
                     // 查找 installer 类型
                     var installerTypes = new[] {
-                        "NSIS", "Inno Setup", "InstallShield", "MSI", "WiX",
+                        "NSIS", "Inno Setup", "InstallShield",
                         "Advanced Installer", "Setup Factory", "Smart Install Maker",
                         "Ghost Installer", "CreateInstall", "Actual Installer",
                         "SetupBuilder", "InstallAware", "Wise",
                         "RAR", "7-Zip", "7z SFX", "Clickteam",
                         "Paquet Builder", "AutoPlay",
                         "IExpress", "WExtract", "Squirrel", "BitRock",
-                        "InstallScript", "WinZip", "WiX MSI",
-                        "APPX", "MSIX", "MSIXBundle"
+                        "InstallScript", "WinZip",
+                        "APPX", "MSIXBundle", "MSIX", "WiX MSI", "WiX", "MSI"
+                        // 修复：MSIXBundle/MSIX 排在 MSI 前面，避免 IndexOf("MSI") 误匹配 "MSIX" 子串
                     };
 
                     foreach (var type in installerTypes)
@@ -210,7 +229,10 @@ namespace SilentParamQuery.Core
                     }
                 }
             }
-            catch { }
+            catch
+            {
+                // 修复：空catch — 版本提取失败属正常情况(无版本信息)，静默跳过
+            }
             return null;
         }
 
@@ -269,7 +291,10 @@ namespace SilentParamQuery.Core
                     if (File.Exists(fullPath))
                         return fullPath;
                 }
-                catch { }
+                catch
+                {
+                    // 修复：空catch — PATH 中个别无效目录跳过即可，不影响查找
+                }
             }
             return null;
         }

@@ -44,23 +44,6 @@ namespace SilentParamQuery.Data
             return GetAll().Find(x => x.Type == type);
         }
 
-        public static List<InstallerInfo> FindByString(string content)
-        {
-            var results = new List<InstallerInfo>();
-            foreach (var info in GetAll())
-            {
-                foreach (var sig in info.StringSignatures)
-                {
-                    if (content.Contains(sig))
-                    {
-                        results.Add(info);
-                        break;
-                    }
-                }
-            }
-            return results;
-        }
-
         private static void InitDatabase()
         {
             // 1. NSIS

@@ -2,12 +2,13 @@
 #include <fstream>
 #include <cstring>
 
+// 修复：统一为CP_UTF8，与scanner.cpp中的WToA一致，确保SaveBatchFile的UTF8→GB2312转换正确
 static std::string WToA(const std::wstring& ws) {
     if (ws.empty()) return "";
-    int len = WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (len <= 0) return "";
     std::string s(len - 1, '\0');
-    WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, &s[0], len, nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &s[0], len, nullptr, nullptr);
     return s;
 }
 

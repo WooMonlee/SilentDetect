@@ -14,7 +14,8 @@
 
 #pragma comment(lib, "shlwapi.lib")
 
-// Log functions (same as main.cpp, duplicated for linking)
+// 日志开关：定义DEBUG_LOG宏时输出debug_log.txt，否则日志函数为空操作
+#ifdef DEBUG_LOG
 static std::wstring g_batchLogPath;
 
 static void InitBatchLog() {
@@ -50,6 +51,11 @@ static void LogW(const wchar_t* fmt, ...) {
     fwprintf(f, L"\n");
     fclose(f);
 }
+#else
+static inline void InitBatchLog() {}
+static inline void Log(const char*, ...) {}
+static inline void LogW(const wchar_t*, ...) {}
+#endif
 
 static std::vector<std::wstring> g_tempFiles;
 
@@ -187,11 +193,12 @@ static bool HasUtf8Bom(const std::wstring& filePath) {
 static std::vector<unsigned char> ReadFileBytes(const std::wstring& filePath) {
     FILE* f = _wfopen(filePath.c_str(), L"rb");
     if (!f) return {};
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::vector<unsigned char> data(sz);
-    fread(data.data(), 1, sz, f);
+    _fseeki64(f, 0, SEEK_END);
+    __int64 fileSize = _ftelli64(f); // 修复：ftell对大文件溢出，改用_ftelli64
+    if (fileSize <= 0) { fclose(f); return {}; }
+    _fseeki64(f, 0, SEEK_SET);
+    std::vector<unsigned char> data((size_t)fileSize);
+    fread(data.data(), 1, (size_t)fileSize, f);
     fclose(f);
     return data;
 }
@@ -342,9 +349,11 @@ std::vector<std::wstring> BR_Scan7zFiles(const std::wstring& dir) {
 
 // 执行7z命令并获取输出
 static std::wstring Run7zCommand(const std::wstring& sevenZPath, const std::wstring& args) {
+    // 修复：句柄泄漏 — 所有路径确保关闭句柄；CreatePipe失败时检查返回值
     SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
-    HANDLE hRead, hWrite;
-    CreatePipe(&hRead, &hWrite, &sa, 0);
+    HANDLE hRead = NULL, hWrite = NULL;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0))
+        return L"";
     SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si = {sizeof(si)};
@@ -692,17 +701,13 @@ bool BR_Process7zFile(HWND hWnd, const std::wstring& zipPath, const std::wstring
             L"确认", MB_YESNO | MB_ICONQUESTION);
         if (ret != IDYES) return false;
 
-        // 删除现有目录（使用 rd /s /q）
-        std::wstring cmd = L"cmd /c rd /s /q \"" + extractDir + L"\"";
-        STARTUPINFOW si = {sizeof(si)};
-        PROCESS_INFORMATION pi = {};
-        std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
-        cmdBuf.push_back(0);
-        CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE,
-            CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+        // 修复：命令注入 — 用SHFileOperation替代cmd /c rmdir
+        std::wstring delPath = extractDir + L'\0';
+        SHFILEOPSTRUCTW fop = {};
+        fop.wFunc = FO_DELETE;
+        fop.pFrom = delPath.c_str();
+        fop.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+        SHFileOperationW(&fop);
     }
 
     // 创建目录
@@ -783,17 +788,14 @@ bool BR_Process7zFile(HWND hWnd, const std::wstring& zipPath, const std::wstring
         std::wstring newDir = std::wstring(progFilesX86) + L"\\" + zipBaseName;
 
         // 检查目标目录
+        // 修复：命令注入 — 用SHFileOperation替代cmd /c rmdir
         if (GetFileAttributesW(newDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            std::wstring cmd = L"cmd /c rd /s /q \"" + newDir + L"\"";
-            STARTUPINFOW si = {sizeof(si)};
-            PROCESS_INFORMATION pi = {};
-            std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
-            cmdBuf.push_back(0);
-            CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, FALSE,
-                CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
+            std::wstring delPath = newDir + L'\0';
+            SHFILEOPSTRUCTW fop = {};
+            fop.wFunc = FO_DELETE;
+            fop.pFrom = delPath.c_str();
+            fop.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+            SHFileOperationW(&fop);
         }
 
         // 移动目录

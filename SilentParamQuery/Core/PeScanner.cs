@@ -255,7 +255,8 @@ namespace SilentParamQuery.Core
             try
             {
                 int peOffset = BitConverter.ToInt32(data, 0x3C);
-                if (peOffset + 4 > data.Length) return null;
+                // 修复：peOffset负数校验 — 恶意PE构造负偏移导致数组越界
+                if (peOffset < 0 || peOffset + 24 > data.Length) return null;
                 if (data[peOffset] != 0x50 || data[peOffset + 1] != 0x45) return null; // PE
 
                 int numSections = BitConverter.ToInt16(data, peOffset + 6);
@@ -282,6 +283,7 @@ namespace SilentParamQuery.Core
                     }
                 }
             }
+            // 修复：空catch — PE段解析失败(非PE文件/畸形PE)非致命，静默跳过
             catch { }
             return null;
         }

@@ -2,7 +2,7 @@ CXX = x86_64-w64-mingw32-g++
 WINDRES = windres
 
 CXXFLAGS = -static -O2 -mwindows -municode -std=c++17 -DUNICODE -D_UNICODE
-LDFLAGS = -lcomctl32 -lshell32 -lole32 -lgdi32 -lcomdlg32 -luser32 -lshlwapi
+LDFLAGS = -lcomctl32 -lshell32 -lole32 -luuid -lgdi32 -lcomdlg32 -luser32 -lshlwapi
 
 TARGET = SilentParamQuery.exe
 SRCS = main.cpp scanner.cpp batgen.cpp batchrun.cpp
@@ -11,18 +11,22 @@ RES_O = resource.o
 TOOLS_RC = tools_resource.rc
 TOOLS_O = tools_resource.o
 
-.PHONY: all clean
+.PHONY: all release debug clean
 
-all: $(TARGET)
+# 默认：发布版（无调试日志）
+all: release
 
-$(RES_O): $(RES_RC) resource.h 大内静探.ico
+# 发布版：日志函数编译为空操作
+release:
 	$(WINDRES) $(RES_RC) -o $(RES_O) --input-format=rc --output-format=coff
-
-$(TOOLS_O): $(TOOLS_RC)
 	$(WINDRES) $(TOOLS_RC) -o $(TOOLS_O) --input-format=rc --output-format=coff
-
-$(TARGET): $(SRCS) $(RES_O) $(TOOLS_O) database.h scanner.h batgen.h batchrun.h resource.h
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRCS) $(RES_O) $(TOOLS_O) $(LDFLAGS)
+
+# 测试版：启用DEBUG_LOG，输出debug_log.txt记录运行详情
+debug:
+	$(WINDRES) $(RES_RC) -o $(RES_O) --input-format=rc --output-format=coff
+	$(WINDRES) $(TOOLS_RC) -o $(TOOLS_O) --input-format=rc --output-format=coff
+	$(CXX) $(CXXFLAGS) -DDEBUG_LOG -o $(TARGET) $(SRCS) $(RES_O) $(TOOLS_O) $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET) $(RES_O) $(TOOLS_O)

@@ -21,10 +21,17 @@ namespace SilentParamQuery
             // 加载窗体图标
             string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "大内静探.ico");
             if (File.Exists(iconPath))
+            {
+                // 修复：Icon泄漏 — 释放旧图标后设置新图标
+                if (this.Icon != null)
+                {
+                    this.Icon.Dispose();
+                }
                 this.Icon = new Icon(iconPath);
+            }
 
             _engine = new DetectorEngine();
-            this.Text = $"大内静探 - 静默参数探测器 v1.0 (支持 {SilentParamDatabase.Count} 种安装器)";
+            this.Text = $"大内静探 - 静默参数探测器 v1.3.2 (支持 {SilentParamDatabase.Count} 种安装器)";
             UpdateDieStatus();
         }
 
@@ -69,11 +76,18 @@ namespace SilentParamQuery
 
         private void ScanFile(string filePath)
         {
+            // 修复：DoEvents重入风险 — 扫描期间禁用输入控件
+            btnBrowse.Enabled = false;
+            lblDrop.AllowDrop = false;
             lblStatus.Text = "正在扫描...";
             lblFilePath.Text = filePath;
             Application.DoEvents();
 
             _currentResult = _engine.Scan(filePath);
+
+            // 修复：扫描结束后恢复控件
+            btnBrowse.Enabled = true;
+            lblDrop.AllowDrop = true;
 
             if (_currentResult.Success)
             {
@@ -83,6 +97,12 @@ namespace SilentParamQuery
                 lblConfidence.Text = _currentResult.GetConfidenceStars();
                 txtCommand.Text = _currentResult.SilentCommand;
 
+                // 修复：Font泄漏 — 清空列表前释放已创建的Font对象
+                foreach (ListViewItem oldItem in lstParams.Items)
+                {
+                    if (oldItem.Font != null && oldItem.Font != lstParams.Font)
+                        oldItem.Font.Dispose();
+                }
                 lstParams.Items.Clear();
                 foreach (var p in _currentResult.Params)
                 {
@@ -110,6 +130,12 @@ namespace SilentParamQuery
                 lblDetectedBy.Text = _currentResult.DetectedBy;
                 lblConfidence.Text = "--";
                 txtCommand.Text = "";
+                // 修复：Font泄漏 — 清空列表前释放已创建的Font对象
+                foreach (ListViewItem oldItem in lstParams.Items)
+                {
+                    if (oldItem.Font != null && oldItem.Font != lstParams.Font)
+                        oldItem.Font.Dispose();
+                }
                 lstParams.Items.Clear();
                 btnGenerateBat.Enabled = false;
                 lblStatus.Text = $"扫描失败 - {_currentResult.ErrorMessage}";
