@@ -614,31 +614,49 @@ ScanResult DieScanner::Scan(const std::wstring& filePath) {
     }
 
     if (detectedType.empty()) {
-        // 修复：提取DIE实际检测结果告知用户文件是什么（即使非安装器）
-        std::string dieInfo;
-        size_t pos = 0;
+        // 提取 DIE JSON 所有 string 值（已自带 "Name: Value" 格式），
+        // 按优先级回落：Format > Installer > Packer > Protector > Tool > Library > Linker > Compiler
+        std::string bestInfo;
+        int bestPriority = 99;
+        size_t pos = detectsIdx;
         while ((pos = output.find("\"string\"", pos)) != std::string::npos) {
             pos += 8;
             while (pos < output.size() && (output[pos] == ' ' || output[pos] == ':')) pos++;
-            if (pos < output.size() && output[pos] == '"') {
-                pos++;
-                size_t end = output.find('"', pos);
-                if (end != std::string::npos) {
-                    if (!dieInfo.empty()) dieInfo += "; ";
-                    dieInfo += output.substr(pos, end - pos);
-                    pos = end + 1;
-                }
+            if (pos >= output.size() || output[pos] != '"') continue;
+            pos++;
+            size_t end = output.find('"', pos);
+            if (end == std::string::npos) break;
+            std::string val = output.substr(pos, end - pos);
+            pos = end + 1;
+
+            size_t colon = val.find(": ");
+            std::string namePart = (colon != std::string::npos) ? val.substr(0, colon) : "";
+
+            int p = 99;
+            if (namePart == "Format") p = 0;
+            else if (namePart == "Installer") p = 1;
+            else if (namePart == "Packer") p = 2;
+            else if (namePart == "Protector") p = 3;
+            else if (namePart == "Tool") p = 4;
+            else if (namePart == "Library") p = 5;
+            else if (namePart == "Linker") p = 6;
+            else if (namePart == "Compiler") p = 7;
+
+            if (p < bestPriority) {
+                bestPriority = p;
+                bestInfo = val;
             }
         }
+
+        std::string dieInfo = bestInfo;
+
         if (!dieInfo.empty()) {
-            result.dieDetection = dieInfo; // 修复：传递DIE检测详情到UI层
-            result.errorMessage = "\xE9\x9D\x9E\xE5\xAE\x89\xE8\xA3\x85\xE5\x99\xA8\xE7\xA8\x8B\xE5\xBA\x8F (" + dieInfo + ")";
+            result.dieDetection = dieInfo;
+            result.errorMessage = "未识别 (" + dieInfo + ")";
         } else
-            result.errorMessage = "DIE \xE6\x9C\xAA\xE8\x83\xBD\xE8\xAF\x86\xE5\x88\xAB\xE5\xAE\x89\xE8\xA3\x85\xE5\x99\xA8\xE7\xB1\xBB\xE5\x9E\x8B";
+            result.errorMessage = "DIE 未能识别安装器类型";
         return result;
     }
-
-    // Map to internal type
     std::string internalType = MapDieType(detectedType);
     const InstallerInfo* dbInfo = DB_FindByType(internalType.c_str());
 

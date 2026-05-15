@@ -557,33 +557,25 @@ static void ScanFile(const std::wstring& filePath) {
         SetWindowTextW(g_hLblDrop, g_currentResult.fileName.c_str());
         SetStatus((L"扫描完成 - " + AToW(g_currentResult.installerFullName)).c_str());
     } else {
-        // 修复：DIE检测到非安装器时，在"安装器"/"版本"行显示实际检测信息
+        SetWindowTextW(g_hLblType, L"未识别");
+        InvalidateRect(g_hLblType, NULL, TRUE);
         if (!g_currentResult.dieDetection.empty()) {
-            SetWindowTextW(g_hLblType, L"非安装器程序"); // 非安装器程序
-            InvalidateRect(g_hLblType, NULL, TRUE);
             std::wstring dieInfo = AToW(g_currentResult.dieDetection);
             SetWindowTextW(g_hLblVer, dieInfo.c_str());
-            InvalidateRect(g_hLblVer, NULL, TRUE);
-            SetWindowTextW(g_hLblDet, AToW(g_currentResult.detectedBy).c_str());
-            InvalidateRect(g_hLblDet, NULL, TRUE);
-            SetWindowTextW(g_hLblConf, L"--");
-            InvalidateRect(g_hLblConf, NULL, TRUE);
         } else {
-            SetWindowTextW(g_hLblType, L"未识别"); // 未识别
-            InvalidateRect(g_hLblType, NULL, TRUE);
             SetWindowTextW(g_hLblVer, L"--");
-            InvalidateRect(g_hLblVer, NULL, TRUE);
-            SetWindowTextW(g_hLblDet, AToW(g_currentResult.detectedBy).c_str());
-            InvalidateRect(g_hLblDet, NULL, TRUE);
-            SetWindowTextW(g_hLblConf, L"--");
-            InvalidateRect(g_hLblConf, NULL, TRUE);
         }
+        InvalidateRect(g_hLblVer, NULL, TRUE);
+        SetWindowTextW(g_hLblDet, AToW(g_currentResult.detectedBy).c_str());
+        InvalidateRect(g_hLblDet, NULL, TRUE);
+        SetWindowTextW(g_hLblConf, L"--");
+        InvalidateRect(g_hLblConf, NULL, TRUE);
         SetWindowTextW(g_hTxtCmd, L"");
         InvalidateRect(g_hTxtCmd, NULL, TRUE);
         ListView_DeleteAllItems(g_hLstParams);
         EnableWindow(g_hBtnGenBat, FALSE);
         SetWindowTextW(g_hLblDrop, g_currentResult.fileName.c_str());
-        SetStatus((L"扫描失败 - " + AToW(g_currentResult.errorMessage)).c_str()); // 扫描失败
+        SetStatus((L"扫描失败 - " + AToW(g_currentResult.errorMessage)).c_str());
     }
 }
 
@@ -957,7 +949,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
     if (g_hIcon) wc.hIcon = g_hIcon;
     RegisterClassExW(&wc);
 
-    std::wstring title = L"\x5927\x5185\x9759\x63A2 v1.3.2"; // 大内静探 v1.3.2
+    std::wstring title = L"\x5927\x5185\x9759\x63A2 v3.3";
 
     g_hWnd = CreateWindowExW(
         WS_EX_ACCEPTFILES,
